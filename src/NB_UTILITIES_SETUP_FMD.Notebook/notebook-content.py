@@ -19,9 +19,6 @@
 
 variable_parameters = {
     "key_vault_uri_name": key_vault_uri_name,
-    "key_vault_tenant_id": key_vault_tenant_id,
-    "key_vault_client_id": key_vault_client_id,
-    "key_vault_client_secret": key_vault_client_secret,
     "lakehouse_schema_enabled": lakehouse_schema_enabled
 }
 
@@ -121,7 +118,7 @@ def create_fabric_domain(domain_name):
     DomainExists=run_fab_command(f'exists .domains/{domain_name}.Domain',capture_output=True, silently_continue=True)
     if DomainExists != "* true":
         try:
-            print(f"Creating Domain: {name}")
+            print(f"Creating Domain: {domain_name}")
             result = run_fab_command(f'create .domains/{domain_name}.Domain',  capture_output=True, silently_continue=True)
             print(f"✅ {domain_name} Domain Created'")
         except Exception as e:
@@ -718,6 +715,10 @@ def create_or_get_fmd_connection(connection_name,connection_role, type):
             elif type =='FabricDataPipelines':
                 run_fab_command(f"""create .connections/{connection_name}.Connection 
                     -P connectionDetails.type=FabricDataPipelines,connectionDetails.creationMethod=FabricDataPipelines.Actions,connectionDetails.parameters.dummy=x,credentialDetails.type=WorkspaceIdentity""")
+            elif type =='Notebooks':
+                run_fab_command(f"""create .connections/{connection_name}.Connection 
+                    -P connectionDetails.type=Notebook,connectionDetails.creationMethod=Notebook.Actions,connectionDetails.parameters.dummy=x,credentialDetails.type=WorkspaceIdentity""")
+                
                 print(f"✅ {connection_name} Created")
         except Exception as e:
             print(f"❌ Failed to create connection: {e}")
@@ -799,8 +800,8 @@ def set_workspace_icon(workspace_id, base64_png):
             response = invoke_fabric_request("put", f"{cluster_base_url}metadata/folders/{workspace_id}", payload)
             response.raise_for_status()
             return response.json()
-        except:
-            print(f"Could not set icon on workspace id {workspace_id}. Ensure that the user is admin on workspace.")
+        except Exception as e:
+            print(f"Could not set icon on workspace id {workspace_id}: {e}. Ensure that the user is admin on workspace.")
             return None
 # -------------------------------
 # FMD specific Icon functions
@@ -821,8 +822,8 @@ def fill_svg(base64_svg, fill_color):
         svg_data = base64.b64decode(base64_svg).decode('utf-8')
         modified_svg = re.sub(r'fill="[^"]+"', f'fill="{fill_color}"', svg_data)
         return base64.b64encode(modified_svg.encode('utf-8')).decode('utf-8')
-    except:
-        print("Failed colorfill of image. Skipping")
+    except Exception as e:
+        print(f"Failed colorfill of image: {e}. Skipping")
 
 def display_workspace_icons(workspaces):
     html = "<table width='100%'>"

@@ -5,12 +5,6 @@
 # META {
 # META   "kernel_info": {
 # META     "name": "synapse_pyspark"
-# META   },
-# META   "dependencies": {
-# META     "lakehouse": {
-# META       "default_lakehouse_name": "",
-# META       "default_lakehouse_workspace_id": ""
-# META     }
 # META   }
 # META }
 
@@ -105,7 +99,7 @@ import re
 from datetime import datetime, timezone
 import json
 from delta.tables import *
-from pyspark.sql.functions import sha2, concat_ws, current_timestamp, expr
+from pyspark.sql.functions import sha2, md5, concat_ws, current_timestamp, expr
 from pyspark.sql.types import StringType
 
 
@@ -287,7 +281,7 @@ print(target_data_path)
 
 # CELL ********************
 
-#Read all incoming changes in Parquet format
+#Read all incoming changes in Delta format
 dfDataChanged= spark.read\
                 .format("delta") \
                 .load(f"{source_changes_data_path}")
@@ -367,11 +361,10 @@ dfDataChanged=handle_cleansing_functions(dfDataChanged,cleansing_rules)
 
 # CELL ********************
 
-non_key_columns = [column for column in dfDataChanged.columns if column not in ('HashedPKColumn')]
+non_key_columns = [column for column in dfDataChanged.columns if column not in ('HashedPKColumn',)]
 
 #add a hashed cloumn to detect changes
-
-dfDataChanged = dfDataChanged.withColumn("HashedNonKeyColumns", sha2(concat_ws("||", *non_key_columns).cast(StringType()), 256))
+dfDataChanged = dfDataChanged.withColumn("HashedNonKeyColumns", md5(concat_ws("||", *non_key_columns).cast(StringType())))
 
 # METADATA ********************
 
@@ -412,7 +405,8 @@ if DeltaTable.isDeltaTable(spark, target_data_path):
 else:
     # Use first load when no data exists yet and then exit 
     dfDataChanged.write.format("delta").mode("overwrite").save(target_data_path)
-    TotalRuntime = str((datetime.now() - start_audit_time)) 
+    end_audit_time = datetime.now()
+    TotalRuntime = str((end_audit_time - start_audit_time)) 
 
     # Your data
     result_data = {
@@ -442,19 +436,11 @@ else:
 # MARKDOWN ********************
 
 # ## Add columns for Merge SCD 2
-
 # CELL ********************
+# Add Action column for merge processing
+# DataChanged = dfDataChanged.withColumn('HashedPKColumn', dfDataChanged['HashedPKColumn'])
+# DataChanged = dfDataChanged.withColumn('Action', lit('U'))
 
-#add a new column MergeKey based on the HashedPKColumn
-dfDataChanged = dfDataChanged.withColumn('HashedPKColumn', dfDataChanged['HashedPKColumn'])
-dfDataChanged = dfDataChanged.withColumn('Action', lit('U'))
-
-# METADATA ********************
-
-# META {
-# META   "language": "python",
-# META   "language_group": "synapse_pyspark"
-# META }
 
 # CELL ********************
 
@@ -653,47 +639,59 @@ columns_to_insert = {column: f"updates.{column}" for column in dfDataOriginal.co
 
 # CELL ********************
 
-deltaTable = DeltaTable.forPath(spark, f'{target_data_path}')
+try:
+    deltaTable = DeltaTable.forPath(spark, f'{target_data_path}')
 
-merge = deltaTable.alias('original') \
-    .merge(dfDataChanged.alias('updates'), 'original.HashedPKColumn = updates.HashedPKColumn and original.RecordStartDate = updates.RecordStartDate') \
-    .whenMatchedUpdate(
-            #
-            # Handle rows to be (soft-) deleted: 
-            # These rows have action 'D' and are NOT deleted in the original
-            #
-            condition="original.IsCurrent == True AND original.IsDeleted == False AND updates.Action = 'D'",
+    merge = deltaTable.alias('original') \
+        .merge(dfDataChanged.alias('updates'), 'original.HashedPKColumn = updates.HashedPKColumn and original.RecordStartDate = updates.RecordStartDate') \
+        .whenMatchedUpdate(
+                #
+                # Handle rows to be (soft-) deleted:
+                # These rows have action 'D' and are NOT deleted in the original
+                #
+                condition="original.IsCurrent == True AND original.IsDeleted == False AND updates.Action = 'D'",
+                set={
+                    "IsDeleted": lit(True),
+                    "RecordEndDate": col('updates.RecordEndDate')
+                }) \
+        .whenMatchedUpdate(
+                #
+                # Handle rows to be updated.
+                # These rows have either action 'D' and ARE deleted in the original (so IsCurrent needs to be set to False)
+                # Or these have action 'U' and, are accompanied by inserts, but IsCurrent must be set to False.
+                #
+            condition="updates.HashedNonKeyColumns == original.HashedNonKeyColumns and original.IsCurrent = 1  ",
             set={
-                "IsDeleted": lit(True),
-                "RecordEndDate": col('updates.RecordEndDate')
+                "IsCurrent": lit(0),
+                "RecordEndDate": col('updates.RecordStartDate')
             }) \
-    .whenMatchedUpdate(
-            #
-            # Handle rows to be updated.
-            # These rows have either action 'D' and ARE deleted in the original (so IsCurrent needs to be set to False)
-            # Or these have action 'U' and, are accompanied by inserts, but IsCurrent must be set to False. 
-            #
-        condition="updates.HashedNonKeyColumns == original.HashedNonKeyColumns and original.IsCurrent = 1  ",
-        set={
-            "IsCurrent": lit(0),
-            "RecordEndDate": col('updates.RecordStartDate')
-        }) \
-    .whenNotMatchedInsert(
-            #
-            # Handle inserts.
-            # These rows have action 'I' and must be inserted.
-            #
-        values={**columns_to_insert,
-                "HashedPKColumn": col("updates.HashedPKColumn"),
-                "HashedNonKeyColumns": col("updates.HashedNonKeyColumns"),
-                "IsCurrent": lit(1),
-                "RecordStartDate": current_timestamp(),
-                "RecordModifiedDate": current_timestamp(),
-                "RecordEndDate": lit('9999-12-31').cast('timestamp'),
-                "IsDeleted": lit(0)})
+        .whenNotMatchedInsert(
+                #
+                # Handle inserts.
+                # These rows have action 'I' and must be inserted.
+                #
+            values={**columns_to_insert,
+                    "HashedPKColumn": col("updates.HashedPKColumn"),
+                    "HashedNonKeyColumns": col("updates.HashedNonKeyColumns"),
+                    "IsCurrent": lit(1),
+                    "RecordStartDate": current_timestamp(),
+                    "RecordModifiedDate": current_timestamp(),
+                    "RecordEndDate": lit('9999-12-31').cast('timestamp'),
+                    "IsDeleted": lit(0)})
 
-# Execute the merge operation
-merge.execute()
+    # Execute the merge operation
+    merge.execute()
+except Exception as e:
+    # Ensure audit log is written even on failure
+    error_data = {"Action": "Error", "ErrorMessage": str(e)[:500]}
+    try:
+        execute_with_outputs(EndNotebookActivity, driver, connstring, database, LogData=json.dumps(error_data))
+
+    except Exception as audit_error:
+        print(f"Audit logging failed: {audit_error}")  # best-effort audit logging
+
+
+    raise
 
 # METADATA ********************
 
@@ -723,7 +721,6 @@ result_data = {
 
     }
     }
-
 
 # METADATA ********************
 

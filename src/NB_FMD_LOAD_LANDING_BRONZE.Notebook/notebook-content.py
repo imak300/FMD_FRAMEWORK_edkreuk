@@ -113,7 +113,7 @@ import re
 from datetime import datetime, timezone
 import json
 from delta.tables import *
-from pyspark.sql.functions import sha2, concat_ws, current_timestamp
+from pyspark.sql.functions import sha2, md5, concat_ws, current_timestamp
 from pyspark.sql.types import StringType
 
 # METADATA ********************
@@ -509,7 +509,7 @@ dfDataChanged=handle_cleansing_functions(dfDataChanged,cleansing_rules)
 non_key_columns = [column for column in dfDataChanged.columns if column not in key_columns]
 
 #add a hashed cloumn to detect changes
-dfDataChanged = dfDataChanged.withColumn("HashedNonKeyColumns", sha2(concat_ws("||", *non_key_columns).cast(StringType()), 256))
+dfDataChanged = dfDataChanged.withColumn("HashedNonKeyColumns", md5(concat_ws("||", *non_key_columns).cast(StringType())))
 
 #Add RecordLoadDate to see when the record arrived
 dfDataChanged = dfDataChanged.withColumn('RecordLoadDate', current_timestamp())
@@ -539,7 +539,6 @@ if DeltaTable.isDeltaTable(spark, target_data_path):
 else:
     # Use first load when no data exists yet and then exit 
     dfDataChanged.write.format("delta").mode("overwrite").save(target_data_path)
-    TotalRuntime = str((datetime.now() - start_audit_time)) 
     TotalRuntime = str((datetime.now() - start_audit_time)) 
     end_audit_time =  str(datetime.now())
     start_audit_time =str(start_audit_time)
@@ -577,23 +576,34 @@ else:
 
 # CELL ********************
 
-#merge table 
-deltaTable = DeltaTable.forPath(spark, f'{target_data_path}')
-if IsIncremental in [False, 'false', 'False']:
-    print(' - Incremental Loading is not enabled, deletes are allowed')
-    merge = deltaTable.alias('original') \
-        .merge(dfDataChanged.alias('updates'), 'original.HashedPKColumn == updates.HashedPKColumn') \
-        .whenNotMatchedInsertAll() \
-        .whenMatchedUpdateAll('original.HashedNonKeyColumns != updates.HashedNonKeyColumns') \
-        .whenNotMatchedBySourceDelete() \
-        .execute()
-elif IsIncremental not in [False, 'false', 'False']:
-    print(' - Incremental Loading is enabled, deletes are not allowed')
-    merge = deltaTable.alias('original') \
-        .merge(dfDataChanged.alias('updates'), 'original.HashedPKColumn == updates.HashedPKColumn') \
-        .whenNotMatchedInsertAll() \
-        .whenMatchedUpdateAll('original.HashedNonKeyColumns != updates.HashedNonKeyColumns') \
-        .execute()
+#merge table
+try:
+    deltaTable = DeltaTable.forPath(spark, f'{target_data_path}')
+    if IsIncremental in [False, 'false', 'False']:
+        print(' - Incremental Loading is not enabled, deletes are allowed')
+        merge = deltaTable.alias('original') \
+            .merge(dfDataChanged.alias('updates'), 'original.HashedPKColumn == updates.HashedPKColumn') \
+            .whenNotMatchedInsertAll() \
+            .whenMatchedUpdateAll('original.HashedNonKeyColumns != updates.HashedNonKeyColumns') \
+            .whenNotMatchedBySourceDelete() \
+            .execute()
+    else:
+        print(' - Incremental Loading is enabled, deletes are not allowed')
+        merge = deltaTable.alias('original') \
+            .merge(dfDataChanged.alias('updates'), 'original.HashedPKColumn == updates.HashedPKColumn') \
+            .whenNotMatchedInsertAll() \
+            .whenMatchedUpdateAll('original.HashedNonKeyColumns != updates.HashedNonKeyColumns') \
+            .execute()
+except Exception as e:
+    # Ensure audit log is written even on failure
+    error_data = {"Action": "Error", "ErrorMessage": str(e)[:500]}
+    try:
+        execute_with_outputs(EndNotebookActivity, driver, connstring, database, LogData=json.dumps(error_data))
+    except Exception as audit_log_error:
+        print(f"Audit logging failed: {audit_log_error}")  # best-effort audit logging
+
+
+    raise
 
 # METADATA ********************
 
@@ -626,7 +636,6 @@ result_data = {
 
     }
     }
-
 
 # METADATA ********************
 
